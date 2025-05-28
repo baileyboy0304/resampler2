@@ -236,20 +236,40 @@ size_t Resampler2Speaker::play(const uint8_t *data, size_t length) {
 }
 
 size_t Resampler2Speaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_wait) {
-  static unsigned long lastPrintTime = 0; // Track last log time
+  // CHECK AVAILABLE MEMORY BEFORE ALLOCATING BUFFERS
+  size_t free_dma_mem = heap_caps_get_free_size(MALLOC_CAP_DMA);
+  size_t free_internal_mem = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  
+  // Log memory status every few seconds
+  static uint32_t last_log_time = 0;
+  uint32_t now = millis();
+  if (now - last_log_time >= 5000) {
+    ESP_LOGD(TAG, "Free DMA memory: %d bytes, Free internal: %d bytes", 
+             free_dma_mem, free_internal_mem);
+    last_log_time = now;
+  }
+  
+  // PREVENT STARTING IF INSUFFICIENT MEMORY
+  if (free_dma_mem < 4096 || free_internal_mem < 8192) {
+    ESP_LOGW(TAG, "Insufficient memory for audio buffers. DMA: %d, Internal: %d", 
+             free_dma_mem, free_internal_mem);
+    return 0;  // Don't start if insufficient memory
+  }
 
   if (this->output_speaker_->is_stopped() || this->output_speaker_2_->is_stopped()) {
-    //ESP_LOGD(TAG, "::play --> Starting ");
+    ESP_LOGD(TAG, "::play --> Starting speakers");
 
+    // ADD DELAY BETWEEN SPEAKER STARTS TO PREVENT MEMORY RACE
     if (this->output_speaker_->is_stopped() && this->state_ != speaker::STATE_STARTING) { 
       this->speakerToStart_ = 1;
       this->start();
-      vTaskDelay(pdMS_TO_TICKS(25)); // Add 25ms delay before checking speaker 2
+      vTaskDelay(pdMS_TO_TICKS(100)); // Increase delay to 100ms to prevent memory race
     }
 
     if (this->output_speaker_->is_running() && this->output_speaker_2_->is_stopped() && this->state_2_ != speaker::STATE_STARTING) { 
         this->speakerToStart_ = 2;
         this->start();
+        vTaskDelay(pdMS_TO_TICKS(50)); // Add delay for second speaker
     }
   }
   this->speakerToStartPlay_ = 0;
@@ -262,7 +282,9 @@ size_t Resampler2Speaker::play(const uint8_t *data, size_t length, TickType_t ti
   } else {
     if (this->ring_buffer_.use_count() == 1) {
       std::shared_ptr<RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
-      bytes_written = temp_ring_buffer->write_without_replacement(data, length, ticks_to_wait);
+      if (temp_ring_buffer != nullptr) {  // ADD NULL CHECK
+        bytes_written = temp_ring_buffer->write_without_replacement(data, length, ticks_to_wait);
+      }
     }
   }
 
@@ -287,33 +309,34 @@ size_t Resampler2Speaker::play(const uint8_t *data, size_t length, TickType_t ti
     size_t bytes_per_sample = bits_per_sample / 8;
     size_t mono_length = length / source_channels;
     
-    // Allocate or resize buffer if needed
+    // Allocate or resize buffer if needed - CHECK MEMORY FIRST
     if (mono_buffer == nullptr || mono_buffer_size < mono_length) {
-      if (mono_buffer != nullptr) {
-        free(mono_buffer);
-      }
-      mono_buffer = static_cast<uint8_t*>(malloc(mono_length));
-      if (mono_buffer == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate mono conversion buffer");
-        need_conversion = false; // Fall back to original data
+      // CHECK IF WE HAVE ENOUGH MEMORY FOR MONO BUFFER
+      if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < mono_length + 1024) {
+        ESP_LOGW(TAG, "Insufficient memory for mono conversion buffer");
+        need_conversion = false;
       } else {
-        mono_buffer_size = mono_length;
+        if (mono_buffer != nullptr) {
+          free(mono_buffer);
+        }
+        mono_buffer = static_cast<uint8_t*>(malloc(mono_length));
+        if (mono_buffer == nullptr) {
+          ESP_LOGE(TAG, "Failed to allocate mono conversion buffer");
+          need_conversion = false; // Fall back to original data
+        } else {
+          mono_buffer_size = mono_length;
+        }
       }
     }
     
     // Perform conversion if buffer allocation succeeded
-    if (need_conversion) {
+    if (need_conversion && mono_buffer != nullptr) {
       // Call the standalone stereoToMono function
       size_t converted_size = stereoToMono(data, mono_buffer, length, bits_per_sample);
       
       if (converted_size > 0) {
         speaker2_data = mono_buffer;
         speaker2_length = converted_size;
-        
-        /*if (millis() - lastPrintTime >= 3000) {
-          ESP_LOGD(TAG, "Converted %d bytes of stereo data to %d bytes of mono for speaker 2", 
-                   length, speaker2_length);
-        }*/
       } else {
         // Conversion failed, fall back to original data
         speaker2_data = data;
@@ -330,14 +353,18 @@ size_t Resampler2Speaker::play(const uint8_t *data, size_t length, TickType_t ti
   } else {
     if (this->ring_buffer_2_.use_count() == 1) {
       std::shared_ptr<RingBuffer> temp_ring_buffer = this->ring_buffer_2_.lock();
-      bytes_written2 = temp_ring_buffer->write(speaker2_data, speaker2_length);
+      if (temp_ring_buffer != nullptr) {  // ADD NULL CHECK
+        bytes_written2 = temp_ring_buffer->write(speaker2_data, speaker2_length);
+      }
     }
   }
 
-  /*if (millis() - lastPrintTime >= 3000) { // Print only every 3 seconds
+  // Log occasionally for debugging
+  static uint32_t last_debug_time = 0;
+  if (now - last_debug_time >= 3000) { // Print only every 3 seconds
     ESP_LOGD(TAG, "length %d, bytes_written %d, byte_written2 %d", length, bytes_written, bytes_written2);
-    lastPrintTime = millis();
-  }*/
+    last_debug_time = now;
+  }
 
   return bytes_written;
 }
